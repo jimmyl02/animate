@@ -49,10 +49,9 @@ class TemporalAttentionModule(nn.Module):
         print('debug - temporal attention prev', grouped_x.shape)
 
         # perform self-attention on the grouped_x
-        # NOTE: use AMP for mixed precision training
-        with torch.autocast(device_type="cuda"):
-            q, k, v = self.to_q(grouped_x), self.to_k(grouped_x), self.to_v(grouped_x)
-            out = self.attn(q, k, v)[0]
+        print('debug - attn', grouped_x.device)
+        q, k, v = self.to_q(grouped_x), self.to_k(grouped_x), self.to_v(grouped_x)
+        out = self.attn(q, k, v)[0]
 
         # rearrange out to be back into the grouped batch and timestep format
         out = rearrange(out, '(b h w) t c -> (b t) c h w', t=self.num_frames, h=h, w=w)
@@ -99,7 +98,6 @@ class ReferenceConditionedAttentionBlock(nn.Module):
     ):
         # begin spatial attention
         # expand and concat output with reference embedding
-        print('debug - new attn block', hidden_states.shape)
         w = hidden_states.shape[3]
         concat = torch.cat((hidden_states, self.reference_tensor), axis=3)
 
@@ -174,7 +172,7 @@ class VideoNet(nn.Module):
             self.ref_cond_attn_blocks[i].skip_temporal_attn = skip_temporal_attn
 
     # forward pass just passes pose + conditioning embeddings to unet and returns activations
-    def forward(self, intial_noise, reference_embeddings, clip_condition_embeddings, skip_temporal_attn=False):
+    def forward(self, intial_noise, timesteps, reference_embeddings, clip_condition_embeddings, skip_temporal_attn=False):
         # update the reference tensors for the ReferenceConditionedResNet modules
         self.update_reference_embeddings(reference_embeddings)
 
@@ -184,7 +182,7 @@ class VideoNet(nn.Module):
         # forward pass the pose + conditioning embeddings through the unet
         return self.unet(
             intial_noise,
-            1,
+            timesteps,
             encoder_hidden_states=clip_condition_embeddings,
         )[0]
 
