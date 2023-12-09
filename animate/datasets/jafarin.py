@@ -9,10 +9,9 @@ from torchvision import io
 from torchvision.transforms import v2
 
 class JafarinVideoDataset(Dataset):
-    def __init__(self, root_dir, num_frames, device) -> None:
+    def __init__(self, root_dir, num_frames) -> None:
         self.root_dir = root_dir
         self.num_frames = num_frames
-        self.device = device
         self.data_files = [f for f in os.listdir(root_dir)]
 
         # create transforms
@@ -38,19 +37,26 @@ class JafarinVideoDataset(Dataset):
         start_idx = random.randint(0, max_start_idx)
         frame_list = frame_list[start_idx:start_idx+self.num_frames]
 
-        ref_img = io.read_image(join(data_folder, 'images', random.choice(frame_list)))
-        ref_img = self.transform(ref_img).to(self.device)
+        try:
+            # in happy path, return images
+            ref_img = io.read_image(join(data_folder, 'images', random.choice(frame_list)))
+            ref_img = self.transform(ref_img)
 
-        poses, images = [], []
-        for frame in frame_list:
-            pose_img = io.read_image(join(data_folder, 'densepose', frame))
-            raw_img = io.read_image(join(data_folder, 'images', frame))
+            poses, images = [], []
+            for frame in frame_list:
+                pose_img = io.read_image(join(data_folder, 'densepose', frame))
+                raw_img = io.read_image(join(data_folder, 'images', frame))
 
-            poses.append(self.transform(pose_img).to(self.device))
-            images.append(self.transform(raw_img).to(self.device))
+                poses.append(self.transform(pose_img))
+                images.append(self.transform(raw_img))
 
-        poses_tensor = torch.stack(poses)
-        images_tensor = torch.stack(images)
+            poses_tensor = torch.stack(poses)
+            images_tensor = torch.stack(images)
 
-        return poses_tensor, images_tensor, ref_img
+            return poses_tensor, images_tensor, ref_img
+        except Exception as e:
+            # in error path, return empty data
+            print('[*] failed to get item from dataset', e)
 
+            # hack to pass the dataloader through
+            return torch.empty((0,0)), torch.empty((0,0)), torch.empty((0,0))
