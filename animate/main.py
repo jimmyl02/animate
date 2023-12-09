@@ -106,11 +106,11 @@ def get_image_dataloader(batch_size, num_frames):
     return dataloader
 
 if __name__ == '__main__':
-    stage_one_batch_size = 1
-    stage_two_batch_size = 1
+    stage_one_batch_size, stage_two_batch_size = 1, 1
+    stage_one_steps, stage_two_steps = 30000, 10000
     latent_width, latent_height = 48, 72
     num_channels_latent = 4
-    num_frames = 12
+    num_frames = 10
     inference_steps = 50
 
     lr_warmup_steps = 500
@@ -148,10 +148,9 @@ if __name__ == '__main__':
         log_with="wandb",
     )
     if accelerator.is_main_process:
-        # accelerator.init_trackers(
-        #     project_name="animate"
-        # )
-        pass
+        accelerator.init_trackers(
+            project_name="animate"
+        )
 
     dataloader = get_image_dataloader(stage_one_batch_size, num_frames)
     optimizer = torch.optim.AdamW(
@@ -163,62 +162,65 @@ if __name__ == '__main__':
     )
 
     global_step = 0
-    for step, data in enumerate(dataloader):
-        pose_data, raw_img_data, ref_img_data = data[0], data[1], data[2]
+    while True:
+        # train until global step is 30,000
+        for step, data in enumerate(dataloader):
+            pose_data, raw_img_data, ref_img_data = data[0], data[1], data[2]
 
-        # we stack the pose to batch it through poseguider
-        pose_stack_data = rearrange(pose_data, 'b t c h w -> (b t) c h w')
+            # we stack the pose to batch it through poseguider
+            pose_stack_data = rearrange(pose_data, 'b t c h w -> (b t) c h w')
 
-        # 1) generate embeddings from CLIP vision encoder
-        with torch.no_grad():
-            processed_img_embeddings = models['vision_processor'](images=ref_img_data, return_tensors="pt").to(device)
-            clip_raw_img_embeddings = models['vision_encoder'](**processed_img_embeddings).last_hidden_state
-        
-        # clip_raw_frame_embeddings is the raw clip embeddings repeated for each frame
-        clip_raw_frame_embeddings = repeat(clip_raw_img_embeddings, 'b l d -> (b repeat) l d', repeat=num_frames)
-
-        # 2) encode reference image with the vae encoder
-        with torch.no_grad():
-            encoded_img_embeddings = vae.encode(ref_img_data)['latent_dist'].mean * vae_scaling_factor
-
-        with accelerator.accumulate(pose_guider_net, reference_net, video_net):
-            # 3) generate pose guided images
-            pose_embeddings = pose_guider_net(pose_stack_data)
-
-            # 4) generate embeddings from reference net
-            reference_embeddings = reference_net(encoded_img_embeddings, clip_raw_img_embeddings)
+            with torch.no_grad():
+                # 1) generate embeddings from CLIP vision encoder
+                processed_img_embeddings = models['vision_processor'](images=ref_img_data, return_tensors="pt").to(device)
+                clip_raw_img_embeddings = models['vision_encoder'](**processed_img_embeddings).last_hidden_state
             
-            # reference_frame_embeddings is the reference embeddings repeated for each frame
-            reference_frame_embeddings = [repeat(ref_emb, 'b c h w -> (b repeat) c h w', repeat=num_frames) for ref_emb in reference_embeddings]
+                # clip_raw_frame_embeddings is the raw clip embeddings repeated for each frame
+                clip_raw_frame_embeddings = repeat(clip_raw_img_embeddings, 'b l d -> (b repeat) l d', repeat=num_frames)
 
-            # 5) generate the noisy latents
-            initial_noise_shape = (stage_one_batch_size * num_frames, num_channels_latent, latent_height, latent_width)
-            initial_noise_latents = get_initial_train_noise_latents(initial_noise_shape, device=device)
+                # 2) encode reference image with the vae encoder
+                encoded_img_embeddings = vae.encode(ref_img_data)['latent_dist'].mean * vae_scaling_factor
 
-            # 5.1) generate train timesteps
-            train_timesteps = retrieve_train_timesteps(scheduler, stage_one_batch_size * num_frames, device)
+            with accelerator.accumulate(pose_guider_net, reference_net, video_net):
+                # 3) generate pose guided images
+                pose_embeddings = pose_guider_net(pose_stack_data)
 
-            # 5.2) generate conditioned noise
-            conditioned_noise_latents = scheduler.add_noise(pose_embeddings, initial_noise_latents, train_timesteps)
+                # 4) generate embeddings from reference net
+                reference_embeddings = reference_net(encoded_img_embeddings, clip_raw_img_embeddings)
+                
+                # reference_frame_embeddings is the reference embeddings repeated for each frame
+                reference_frame_embeddings = [repeat(ref_emb, 'b c h w -> (b repeat) c h w', repeat=num_frames) for ref_emb in reference_embeddings]
 
-            # 6) predict noise for video frames
-            noise_pred = video_net(conditioned_noise_latents, train_timesteps, reference_frame_embeddings, clip_raw_frame_embeddings, skip_temporal_attn=True)
-            loss = F.mse_loss(noise_pred, initial_noise_latents)
-            # loss.backward()
-            accelerator.backward(loss)
+                # 5) generate the noisy latents
+                initial_noise_shape = (stage_one_batch_size * num_frames, num_channels_latent, latent_height, latent_width)
+                initial_noise_latents = get_initial_train_noise_latents(initial_noise_shape, device=device)
 
-            # backward optimizer pass
-            torch.nn.utils.clip_grad_norm_(list(pose_guider_net.parameters()) + list(reference_net.parameters()) + list(video_net.parameters()),
-                                        1.0)
-            optimizer.step()
-            optimizer.zero_grad()
+                # 5.1) generate train timesteps
+                train_timesteps = retrieve_train_timesteps(scheduler, stage_one_batch_size * num_frames, device)
+
+                # 5.2) generate conditioned noise
+                conditioned_noise_latents = scheduler.add_noise(pose_embeddings, initial_noise_latents, train_timesteps)
+
+                # 6) predict noise for video frames
+                noise_pred = video_net(conditioned_noise_latents, train_timesteps, reference_frame_embeddings, clip_raw_frame_embeddings, skip_temporal_attn=True)
+                loss = F.mse_loss(noise_pred, initial_noise_latents)
+                accelerator.backward(loss)
+
+                # backward optimizer pass
+                torch.nn.utils.clip_grad_norm_(list(pose_guider_net.parameters()) + list(reference_net.parameters()) + list(video_net.parameters()),
+                                            1.0)
+                optimizer.step()
+                optimizer.zero_grad()
 
             # log loss + update global step
             loss_item = loss.detach().item()
             accelerator.log({"stage_one_loss": loss_item})
-            # if global_step % 500 == 0:
-            print(f'step: {global_step} loss: {loss_item}')
+            if global_step % 500 == 0:
+                print(f'step: {global_step} loss: {loss_item}')
             global_step += 1
+
+            if global_step == stage_two_batch_size:
+                break
 
 
     '''
