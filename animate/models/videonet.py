@@ -15,7 +15,7 @@ class SpatialAttentionModule(nn.Module):
         super(SpatialAttentionModule, self).__init__()
 
         # define covolution to find attention maps
-        self.conv = nn.Conv2d(in_channels=2, out_channels=1, kernel_size=7, stride=1, padding=3, dilation=1).half()
+        self.conv = nn.Conv2d(in_channels=2, out_channels=1, kernel_size=7, stride=1, padding=3, dilation=1)
 
     # forward passes the activation through a spatial attention module
     def forward(self, x):
@@ -40,6 +40,11 @@ class TemporalAttentionModule(nn.Module):
         self.to_k = nn.Linear(num_inp_channels, embed_dim)
         self.to_v = nn.Linear(num_inp_channels, embed_dim)
         self.attn = nn.MultiheadAttention(embed_dim, num_heads)
+
+        # convert batch norm layers to float
+        for layer in self.attn.modules():
+            if isinstance(layer, nn.BatchNorm2d):
+                layer.float()
 
     # forward performs temporal attention on the input (b,t,h,w,c)
     def forward(self, x):

@@ -2,6 +2,7 @@ import torch
 from diffusers import StableDiffusionPipeline
 from diffusers.models import AutoencoderKL
 from diffusers.schedulers import PNDMScheduler
+from diffusers.optimization import get_cosine_schedule_with_warmup
 from transformers import CLIPVisionModel, CLIPImageProcessor
 from torch.utils.data import DataLoader
 from einops import rearrange, repeat
@@ -17,7 +18,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 torch.manual_seed(17)
 
 def debug():
-    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16).to("cuda")
+    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5").to("cuda")
 
     prompt = 'Astronaut riding a horse on desert, holding a Neo matrix indices flag, matrix theme, artstation, concept art, crepuscular rays, smooth, sharp focus, hd'
     img = pipe(prompt).images[0]
@@ -26,7 +27,7 @@ def debug():
 
 # get_models gets the default models
 def get_models(latent_channels, num_frames):
-    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16).to(device)
+    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5").to(device)
     
     # define and freeze vision encoder weights
     vision_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
@@ -83,8 +84,8 @@ def retrieve_train_timesteps(
     return timesteps
 
 # get_initial_inference_noise_latents gets the initial noise latents
-def get_initial_inference_noise_latents(shape, scheduler, device, dtype):
-    initial_noise_latents = torch.randn(shape, device=device, dtype=dtype)
+def get_initial_inference_noise_latents(shape, scheduler, device):
+    initial_noise_latents = torch.randn(shape, device=device)
 
     # scale the noise latents by the scheduler
     initial_noise_latents = initial_noise_latents * scheduler.init_noise_sigma
@@ -92,8 +93,8 @@ def get_initial_inference_noise_latents(shape, scheduler, device, dtype):
     return initial_noise_latents
 
 # get_initial_train_noise_latents gets the initial noise latents
-def get_initial_train_noise_latents(shape, device, dtype):
-    initial_noise_latents = torch.randn(shape, device=device, dtype=dtype)
+def get_initial_train_noise_latents(shape, device):
+    initial_noise_latents = torch.randn(shape, device=device)
 
     return initial_noise_latents
 
@@ -105,15 +106,15 @@ def get_image_dataloader(batch_size, num_frames):
     return dataloader
 
 if __name__ == '__main__':
-    stage_one_batch_size = 2
+    stage_one_batch_size = 1
     stage_two_batch_size = 1
     latent_width, latent_height = 48, 72
     num_channels_latent = 4
-    num_frames = 16
+    num_frames = 12
     inference_steps = 50
 
-    lr_warmup_steups = 500
-    learning_rate = 1e-4
+    lr_warmup_steps = 500
+    learning_rate = 1e-5
 
     # configuration_values
     config = {
@@ -139,86 +140,95 @@ if __name__ == '__main__':
     Begin stage one of training
     - stage one training objective is generating good images from poses (no temporal consistency)
     '''
-    
-    # get the image data loader
-    dataloader = get_image_dataloader(stage_one_batch_size, num_frames)
 
-    # define accelerator, dataloader, and optimizer for stage one training
+    # define dataloader and optimizer for stage one training
     accelerator = Accelerator(
-        gradient_accumulation_steps=config["gradient_accumulation_steps"],
-        mixed_precision=config["mixed_precision"],
+        gradient_accumulation_steps=config['gradient_accumulation_steps'],
+        mixed_precision=config['mixed_precision'],
         log_with="wandb",
     )
-
     if accelerator.is_main_process:
-        # accelerator.init_trackers("animate")
+        # accelerator.init_trackers(
+        #     project_name="animate"
+        # )
         pass
 
+    dataloader = get_image_dataloader(stage_one_batch_size, num_frames)
     optimizer = torch.optim.AdamW(
-        list(pose_guider_net.parameters()) + list(reference_net.parameters()) + list(video_net.parameters()), 
+        list(pose_guider_net.parameters()) + list(video_net.parameters())  + list(reference_net.parameters()),
         lr=learning_rate,
     )
+    vae, pose_guider_net, reference_net, video_net, optimizer, dataloader = accelerator.prepare(
+        vae, pose_guider_net, reference_net, video_net, optimizer, dataloader
+    )
 
-    # vae, pose_guider_net, reference_net, video_net, optimizer, dataloader = accelerator.prepare(
-    #     vae, pose_guider_net, reference_net, video_net, optimizer, dataloader
-    # )
+    global_step = 0
+    for step, data in enumerate(dataloader):
+        pose_data, raw_img_data, ref_img_data = data[0], data[1], data[2]
 
-    # DEBUG - perform one loop training loop for the first stage of training
-    idx_data = next(enumerate(dataloader))
-    data = idx_data[1]
-    pose_data, raw_img_data, ref_img_data = data[0], data[1], data[2]
+        # we stack the pose to batch it through poseguider
+        pose_stack_data = rearrange(pose_data, 'b t c h w -> (b t) c h w')
 
-    # we stack the pose to batch it through poseguider
-    pose_stack_data = rearrange(pose_data, 'b t c h w -> (b t) c h w')
+        # 1) generate embeddings from CLIP vision encoder
+        with torch.no_grad():
+            processed_img_embeddings = models['vision_processor'](images=ref_img_data, return_tensors="pt").to(device)
+            clip_raw_img_embeddings = models['vision_encoder'](**processed_img_embeddings).last_hidden_state
+        
+        # clip_raw_frame_embeddings is the raw clip embeddings repeated for each frame
+        clip_raw_frame_embeddings = repeat(clip_raw_img_embeddings, 'b l d -> (b repeat) l d', repeat=num_frames)
 
-    # 1) generate embeddings from CLIP vision encoder
-    with torch.no_grad():
-        processed_img_embeddings = models['vision_processor'](images=ref_img_data, return_tensors="pt").to(device)
-        clip_raw_img_embeddings = models['vision_encoder'](**processed_img_embeddings).last_hidden_state.to(dtype=torch.float16)
-    
-    # clip_raw_frame_embeddings is the raw clip embeddings repeated for each frame
-    clip_raw_frame_embeddings = repeat(clip_raw_img_embeddings, 'b l d -> (b repeat) l d', repeat=num_frames)
+        # 2) encode reference image with the vae encoder
+        with torch.no_grad():
+            encoded_img_embeddings = vae.encode(ref_img_data)['latent_dist'].mean * vae_scaling_factor
 
-    # 2) generate pose guided images
-    pose_embeddings = pose_guider_net(pose_stack_data).to(dtype=torch.float16)
+        with accelerator.accumulate(pose_guider_net, reference_net, video_net):
+            # 3) generate pose guided images
+            pose_embeddings = pose_guider_net(pose_stack_data)
 
-    # 3) encode reference image with the vae encoder
-    with torch.no_grad():
-        half_precision_ref_img_data = ref_img_data.to(dtype=torch.float16)
-        encoded_img_embeddings = vae.encode(half_precision_ref_img_data)['latent_dist'].mean * vae_scaling_factor
+            # 4) generate embeddings from reference net
+            reference_embeddings = reference_net(encoded_img_embeddings, clip_raw_img_embeddings)
+            
+            # reference_frame_embeddings is the reference embeddings repeated for each frame
+            reference_frame_embeddings = [repeat(ref_emb, 'b c h w -> (b repeat) c h w', repeat=num_frames) for ref_emb in reference_embeddings]
 
-    # 4) generate embeddings from reference net
-    reference_embeddings = reference_net(encoded_img_embeddings, clip_raw_img_embeddings)
-    
-    # reference_frame_embeddings is the reference embeddings repeated for each frame
-    reference_frame_embeddings = [repeat(ref_emb, 'b c h w -> (b repeat) c h w', repeat=num_frames) for ref_emb in reference_embeddings]
+            # 5) generate the noisy latents
+            initial_noise_shape = (stage_one_batch_size * num_frames, num_channels_latent, latent_height, latent_width)
+            initial_noise_latents = get_initial_train_noise_latents(initial_noise_shape, device=device)
 
-    # 5) generate the noisy latents
-    initial_noise_shape = (stage_one_batch_size * num_frames, num_channels_latent, latent_height, latent_width)
-    initial_noise_latents = get_initial_train_noise_latents(initial_noise_shape, device=device, dtype=torch.float16)
+            # 5.1) generate train timesteps
+            train_timesteps = retrieve_train_timesteps(scheduler, stage_one_batch_size * num_frames, device)
 
-    # 5.1) generate train timesteps
-    train_timesteps = retrieve_train_timesteps(scheduler, stage_one_batch_size * num_frames, device)
+            # 5.2) generate conditioned noise
+            conditioned_noise_latents = scheduler.add_noise(pose_embeddings, initial_noise_latents, train_timesteps)
 
-    # 5.2) generate conditioned noise
-    conditioned_noise_latents = scheduler.add_noise(pose_embeddings, initial_noise_latents, train_timesteps)
+            # 6) predict noise for video frames
+            noise_pred = video_net(conditioned_noise_latents, train_timesteps, reference_frame_embeddings, clip_raw_frame_embeddings, skip_temporal_attn=True)
+            loss = F.mse_loss(noise_pred, initial_noise_latents)
+            # loss.backward()
+            accelerator.backward(loss)
 
-    # 6) predict noise for video frames
-    print('debug - predicting noise for video frames')
-    noise_pred = video_net(conditioned_noise_latents, train_timesteps, reference_frame_embeddings, clip_raw_frame_embeddings, skip_temporal_attn=True)
-    loss = F.mse_loss(noise_pred, initial_noise_latents)
-    # accelerator.backward(loss)
-    loss.backward()
+            # backward optimizer pass
+            torch.nn.utils.clip_grad_norm_(list(pose_guider_net.parameters()) + list(reference_net.parameters()) + list(video_net.parameters()),
+                                        1.0)
+            optimizer.step()
+            optimizer.zero_grad()
 
-    # TODO(jimmy): consider clipping gradient norms
-    optimizer.step()
-    optimizer.zero_grad()
+            # log loss + update global step
+            loss_item = loss.detach().item()
+            accelerator.log({"stage_one_loss": loss_item})
+            # if global_step % 500 == 0:
+            print(f'step: {global_step} loss: {loss_item}')
+            global_step += 1
+
+
+    '''
+    Begin stage two of training
+    - stage two training objective is generating temporally consistent images (freeze video net besides temporal)
+    '''
 
     # decode latents from initial latents, noise prediction, and the timesteps
     # print('debug - latents', noise_pred.shape, train_timesteps.shape, initial_noise_latents.shape)
     # latents = scheduler.step(noise_pred, train_timesteps.cpu(), initial_noise_latents, return_dict=False)[0]
-
-    # 7) stage two training objective is generating temporally consistent images (freeze video net besides temporal)
 
     # 8) inference stage - run main video denoising loop, with condition embeddings from reference net + CLIP
     # TODO(jimmy): write the main unet denoising loop

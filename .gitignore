@@ -1,4 +1,6 @@
 venv
 datasets
+wandb
+!animate/datasets
 
 **/__pycache__
