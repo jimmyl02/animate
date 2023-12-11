@@ -29,11 +29,12 @@ class SpatialAttentionModule(nn.Module):
 
 # TemporalAttentionModule is a temporal attention module
 class TemporalAttentionModule(nn.Module):
-    def __init__(self, num_inp_channels: int, num_frames: int, embed_dim: int = 40, num_heads: int = 8) -> None:
+    def __init__(self, num_inp_channels: int, num_frames: int, embed_dim: int = 40, num_heads: int = 4) -> None:
         super(TemporalAttentionModule, self).__init__()
 
         self.num_inp_channels = num_inp_channels
         self.num_frames = num_frames
+        self.embed_dim = embed_dim
 
         # create multiheaded attention module
         self.to_q = nn.Linear(num_inp_channels, embed_dim)
@@ -41,28 +42,19 @@ class TemporalAttentionModule(nn.Module):
         self.to_v = nn.Linear(num_inp_channels, embed_dim)
         self.attn = nn.MultiheadAttention(embed_dim, num_heads)
 
-        # convert batch norm layers to float
-        for layer in self.attn.modules():
-            if isinstance(layer, nn.BatchNorm2d):
-                layer.float()
-
     # forward performs temporal attention on the input (b,t,h,w,c)
     def forward(self, x):
-        print('debug - shape', x.shape)
         h, w = x.shape[2], x.shape[3]
         grouped_x = rearrange(x, '(b t) c h w -> (b h w) t c', t=self.num_frames)
-        print('debug - temporal attention prev', grouped_x.shape)
 
         # perform self-attention on the grouped_x
-        print('debug - attn', grouped_x.device)
         q, k, v = self.to_q(grouped_x), self.to_k(grouped_x), self.to_v(grouped_x)
-        out = self.attn(q, k, v)[0]
+        attn_out = self.attn(q, k, v)[0]
 
         # rearrange out to be back into the grouped batch and timestep format
-        out = rearrange(out, '(b h w) t c -> (b t) c h w', t=self.num_frames, h=h, w=w)
-        print('debug - temporal attention', grouped_x.shape, out.shape)
-        
-        return x
+        attn_out = rearrange(attn_out, '(b h w) t c -> (b t) c h w', t=self.num_frames, h=h, w=w)
+
+        return attn_out + x
 
 
 # ReferenceConditionedAttentionBlock is an attention block which performs spatial and temporal attention
@@ -78,7 +70,7 @@ class ReferenceConditionedAttentionBlock(nn.Module):
 
         # extract channel dimension from provided cross_attn and 
         num_channels = cross_attn.config.in_channels
-        embed_dim = cross_attn.config.attention_head_dim
+        embed_dim = cross_attn.config.in_channels
         self.tam = TemporalAttentionModule(num_channels, self.num_frames, embed_dim=embed_dim)
 
         # store the reference tensor used by this module (this must be updated before the forward pass)
