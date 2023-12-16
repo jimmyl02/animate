@@ -3,5 +3,6 @@ datasets
 wandb
 !animate/datasets
 ckpts
+out
 
 **/__pycache__
