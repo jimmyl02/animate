@@ -5,26 +5,70 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models import UNet2DConditionModel, Transformer2DModel
 from einops import rearrange
+from xformers.components import MultiHeadDispatch
+from xformers.components.attention import ScaledDotProduct
+from xformers.components.positional_embedding import SinePositionalEmbedding
+from xformers.components.multi_head_dispatch import MultiHeadDispatch
+from xformers.ops import memory_efficient_attention
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# SpatialAttentionModule is a spatial attention module
-# credit: https://github.com/Peachypie98/CBAM/blob/main/cbam.py
+# LayerNorm from https://github.com/hyunwoongko/transformer
+class LayerNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-12):
+        super(LayerNorm, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        var = x.var(-1, unbiased=False, keepdim=True)
+        # '-1' means last dimension. 
+
+        out = (x - mean) / torch.sqrt(var + self.eps)
+        out = self.gamma * out + self.beta
+        return out
+
+# SpatialAttentionModule is a spatial attention module between reference and input
 class SpatialAttentionModule(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, num_inp_channels: int, embed_dim: int = 40, num_heads: int = 4) -> None:
         super(SpatialAttentionModule, self).__init__()
 
-        # define covolution to find attention maps
-        self.conv = nn.Conv2d(in_channels=2, out_channels=1, kernel_size=7, stride=1, padding=3, dilation=1)
+        # create multiheaded attention module
+        self.to_q = nn.Linear(num_inp_channels, embed_dim)
+        self.to_k = nn.Linear(num_inp_channels, embed_dim)
+        self.to_v = nn.Linear(num_inp_channels, embed_dim)
+        self.pos_embed = SinePositionalEmbedding(embed_dim)
+        self.norm1 = LayerNorm(embed_dim)
+        self.ffn = nn.Linear(embed_dim, embed_dim)
+        self.norm2 = LayerNorm(embed_dim)
 
     # forward passes the activation through a spatial attention module
-    def forward(self, x):
-        max = torch.max(x,1)[0].unsqueeze(1)
-        avg = torch.mean(x,1).unsqueeze(1)
-        concat = torch.cat((max,avg), dim=1)
-        output = self.conv(concat)
-        output = F.sigmoid(output) * x 
-        return output 
+    def forward(self, x, reference_tensor):
+        # expand and concat x with reference embedding where x is (b*t,c,h,w)
+        orig_w = x.shape[3]
+        concat = torch.cat((x, reference_tensor), axis=3)
+        h, w = concat.shape[2], concat.shape[3]
+
+        # re-arrange data from (b*t,c,h,w) to correct groupings to (b*t,w*h,c)
+        grouped_x = rearrange(concat, 'bt c h w -> bt (h w) c')
+
+        # compute self-attention on the concatenated data along w dimension
+        grouped_x = self.pos_embed(grouped_x)
+        q, k, v = self.to_q(grouped_x), self.to_k(grouped_x), self.to_v(grouped_x)
+        attn_out = memory_efficient_attention(q, k, v)
+        norm1_out = self.norm1(attn_out + grouped_x)
+        ffn_out = self.ffn(norm1_out)
+        attn_out = self.norm2(norm1_out + ffn_out)
+
+        # re-arrange data from (b*t,w*h,c) to (b*t,c,h,w)
+        attn_out = rearrange(attn_out, 'bt (h w) c -> bt c h w', h=h, w=w)
+
+        # take only the first half of the output concat tensor (b,c,h,w)
+        out = attn_out[:, :, :, :orig_w]
+
+        return out
 
 
 # TemporalAttentionModule is a temporal attention module
@@ -40,7 +84,10 @@ class TemporalAttentionModule(nn.Module):
         self.to_q = nn.Linear(num_inp_channels, embed_dim)
         self.to_k = nn.Linear(num_inp_channels, embed_dim)
         self.to_v = nn.Linear(num_inp_channels, embed_dim)
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads)
+        self.pos_embed = SinePositionalEmbedding(embed_dim)
+        self.norm1 = LayerNorm(embed_dim)
+        self.ffn = nn.Linear(embed_dim, embed_dim)
+        self.norm2 = LayerNorm(embed_dim)
 
     # forward performs temporal attention on the input (b,t,h,w,c)
     def forward(self, x):
@@ -48,8 +95,9 @@ class TemporalAttentionModule(nn.Module):
         grouped_x = rearrange(x, '(b t) c h w -> (b h w) t c', t=self.num_frames)
 
         # perform self-attention on the grouped_x
+        grouped_x = self.pos_embed(grouped_x)
         q, k, v = self.to_q(grouped_x), self.to_k(grouped_x), self.to_v(grouped_x)
-        attn_out = self.attn(q, k, v)[0]
+        attn_out = memory_efficient_attention(q, k, v)
 
         # rearrange out to be back into the grouped batch and timestep format
         attn_out = rearrange(attn_out, '(b h w) t c -> (b t) c h w', t=self.num_frames, h=h, w=w)
@@ -66,11 +114,11 @@ class ReferenceConditionedAttentionBlock(nn.Module):
         self.skip_temporal_attn = skip_temporal_attn
         self.num_frames = num_frames
         self.cross_attn = cross_attn
-        self.sam = SpatialAttentionModule()
 
         # extract channel dimension from provided cross_attn and 
         num_channels = cross_attn.config.in_channels
         embed_dim = cross_attn.config.in_channels
+        self.sam = SpatialAttentionModule(num_channels, embed_dim=embed_dim)
         self.tam = TemporalAttentionModule(num_channels, self.num_frames, embed_dim=embed_dim)
 
         # store the reference tensor used by this module (this must be updated before the forward pass)
@@ -79,6 +127,11 @@ class ReferenceConditionedAttentionBlock(nn.Module):
     # update_reference_tensor updates the reference tensor for the module
     def update_reference_tensor(self, reference_tensor: torch.FloatTensor):
         self.reference_tensor = reference_tensor
+
+    # update_num_frames updates the number of frames the temporal attention module is configured for
+    def update_num_frames(self, num_frames: int):
+        self.num_frames = num_frames
+        self.tam.num_frames = num_frames
 
     # forward performs spatial attention, cross attention, and temporal attention
     def forward(
@@ -94,15 +147,9 @@ class ReferenceConditionedAttentionBlock(nn.Module):
         return_dict: bool = True,
     ):
         # begin spatial attention
-        # expand and concat output with reference embedding
-        w = hidden_states.shape[3]
-        concat = torch.cat((hidden_states, self.reference_tensor), axis=3)
 
-        # pass concat tensor through spatial attention module along w axis (b,c,h,w)
-        out = self.sam(concat)
-
-        # take only the first half of the output concat tensor (b,c,h,w)
-        out = out[:, :, :, :w]
+        # pass concat tensor through spatial attention module along w axis (b,c,w,h)
+        out = self.sam(hidden_states, self.reference_tensor)
 
         # begin cross attention
         out = self.cross_attn(out, encoder_hidden_states, timestep, added_cond_kwargs, class_labels,
@@ -161,6 +208,12 @@ class VideoNet(nn.Module):
         for i in range(len(self.ref_cond_attn_blocks)):
             # update the reference conditioned blocks embedding
             self.ref_cond_attn_blocks[i].update_reference_tensor(reference_embeddings[i])
+
+    # update_num_frames updates all temporal attention block frame number
+    def update_num_frames(self, num_frames):
+        for i in range(len(self.ref_cond_attn_blocks)):
+            # update the number of frames
+            self.ref_cond_attn_blocks[i].update_num_frames(num_frames)
 
     # update_skip_temporal_attn updates all the skip temporal attention attributes
     def update_skip_temporal_attn(self, skip_temporal_attn):
