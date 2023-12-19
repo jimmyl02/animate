@@ -102,8 +102,8 @@ def get_validation_loss(val_dataloader, num_frames, pose_guider_net: PoseGuider,
 
 if __name__ == '__main__':
     ckpt_dir = '../ckpts'
-    stage_one_batch_size = 6
-    stage_one_steps = 160000 # we manually tune steps to the equivalent of steps*batch=30000*64
+    stage_one_batch_size = 8
+    stage_one_steps = 200000 # we manually tune steps to the equivalent of steps*batch=30000*64 (orig 16k, moved to 20k)
     latent_width, latent_height = 48, 72
     num_channels_latent = 4
     num_frames = 2

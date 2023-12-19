@@ -10,29 +10,36 @@ from xformers.ops import memory_efficient_attention
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+# LayerNorm from https://github.com/hyunwoongko/transformer
+class LayerNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-12):
+        super(LayerNorm, self).__init__()
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(-1, keepdim=True)
+        var = x.var(-1, unbiased=False, keepdim=True)
+        # '-1' means last dimension. 
+
+        out = (x - mean) / torch.sqrt(var + self.eps)
+        out = self.gamma * out + self.beta
+        return out
+
 # SpatialAttentionModule is a spatial attention module between reference and input
 class SpatialAttentionModule(nn.Module):
     def __init__(self, num_inp_channels: int, embed_dim: int = 40, num_heads: int = 4) -> None:
         super(SpatialAttentionModule, self).__init__()
-
-        self.num_inp_channels = num_inp_channels
-        self.embed_dim = embed_dim
-
-        # create input projection layers
-        self.norm_in = nn.GroupNorm(num_groups=32, num_channels=num_inp_channels, eps=1e-6, affine=True)
-        self.proj_in = nn.Conv2d(num_inp_channels, num_inp_channels, kernel_size=1, stride=1, padding=0)
 
         # create multiheaded attention module
         self.to_q = nn.Linear(num_inp_channels, embed_dim)
         self.to_k = nn.Linear(num_inp_channels, embed_dim)
         self.to_v = nn.Linear(num_inp_channels, embed_dim)
         self.pos_embed = SinePositionalEmbedding(embed_dim)
-        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm1 = LayerNorm(embed_dim)
         self.ffn = nn.Linear(embed_dim, embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
-
-        # create output projection layer
-        self.proj_out = nn.Conv2d(num_inp_channels, num_inp_channels, kernel_size=1, stride=1, padding=0)
+        self.norm2 = LayerNorm(embed_dim)
 
     # forward passes the activation through a spatial attention module
     def forward(self, x, reference_tensor):
@@ -41,12 +48,8 @@ class SpatialAttentionModule(nn.Module):
         concat = torch.cat((x, reference_tensor), axis=3)
         h, w = concat.shape[2], concat.shape[3]
 
-        # pass data through input projections
-        proj_x = self.norm_in(concat)
-        proj_x = self.proj_in(proj_x)
-
         # re-arrange data from (b*t,c,h,w) to correct groupings to (b*t,w*h,c)
-        grouped_x = rearrange(proj_x, 'bt c h w -> bt (h w) c')
+        grouped_x = rearrange(concat, 'bt c h w -> bt (h w) c')
 
         # compute self-attention on the concatenated data along w dimension
         grouped_x = self.pos_embed(grouped_x)
@@ -62,9 +65,6 @@ class SpatialAttentionModule(nn.Module):
         # take only the first half of the output concat tensor (b,c,h,w)
         out = attn_out[:, :, :, :orig_w]
 
-        # pass output through out projection
-        out = self.proj_out(out)
-
         return out
 
 
@@ -77,46 +77,27 @@ class TemporalAttentionModule(nn.Module):
         self.num_frames = num_frames
         self.embed_dim = embed_dim
 
-        # create input projection layers
-        self.norm_in = nn.GroupNorm(num_groups=32, num_channels=num_inp_channels, eps=1e-6, affine=True)
-        self.proj_in = nn.Conv2d(num_inp_channels, num_inp_channels, kernel_size=1, stride=1, padding=0)
-
         # create multiheaded attention module
         self.to_q = nn.Linear(num_inp_channels, embed_dim)
         self.to_k = nn.Linear(num_inp_channels, embed_dim)
         self.to_v = nn.Linear(num_inp_channels, embed_dim)
         self.pos_embed = SinePositionalEmbedding(embed_dim)
-        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm1 = LayerNorm(embed_dim)
         self.ffn = nn.Linear(embed_dim, embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
+        self.norm2 = LayerNorm(embed_dim)
 
-        # create output projection layer
-        self.proj_out = nn.Conv2d(num_inp_channels, num_inp_channels, kernel_size=1, stride=1, padding=0)
-
-    # forward performs temporal attention on the input (b*t,c,h,w)
+    # forward performs temporal attention on the input (b,t,h,w,c)
     def forward(self, x):
         h, w = x.shape[2], x.shape[3]
-
-        # pass data through input projections
-        proj_x = self.norm_in(x)
-        proj_x = self.proj_in(proj_x)
-
-        # re-arrange data from (b*t,c,h,w) to correct groupings to (b*t,w*h,c)
         grouped_x = rearrange(x, '(b t) c h w -> (b h w) t c', t=self.num_frames)
 
         # perform self-attention on the grouped_x
         grouped_x = self.pos_embed(grouped_x)
         q, k, v = self.to_q(grouped_x), self.to_k(grouped_x), self.to_v(grouped_x)
         attn_out = memory_efficient_attention(q, k, v)
-        norm1_out = self.norm1(attn_out + grouped_x)
-        ffn_out = self.ffn(norm1_out)
-        attn_out = self.norm2(norm1_out + ffn_out)
 
         # rearrange out to be back into the grouped batch and timestep format
         attn_out = rearrange(attn_out, '(b h w) t c -> (b t) c h w', t=self.num_frames, h=h, w=w)
-
-        # pass attention output through out projection
-        attn_out = self.proj_out(attn_out)
 
         return attn_out + x
 
