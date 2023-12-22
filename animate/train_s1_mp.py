@@ -17,7 +17,8 @@ from datasets.jafarin import JafarinVideoDataset
 from models.poseguider import PoseGuider
 from models.referencenet import ReferenceNet
 from models.videonet import VideoNet
-from util import get_models, retrieve_train_timesteps, get_initial_noise_latents, get_conditioning_embeddings, encode_images, infer_fixed_sample_mp, retrieve_inference_timesteps
+from util import (get_models, retrieve_train_timesteps, get_initial_noise_latents, get_conditioning_embeddings,
+                   encode_images, infer_fixed_sample_mp, retrieve_inference_timesteps, load_mm)
 
 torch.manual_seed(17)
 
@@ -102,6 +103,8 @@ def get_validation_loss(val_dataloader, num_frames, pose_guider_net: PoseGuider,
 
 if __name__ == '__main__':
     ckpt_dir = '../ckpts'
+    # start_ckpt = '../ckpts/ckpt_s1_t1703121393_v2.pt'
+    start_ckpt = ''
     stage_one_batch_size = 8
     stage_one_steps = 200000 # we manually tune steps to the equivalent of steps*batch=30000*64 (orig 16k, moved to 20k)
     latent_width, latent_height = 48, 72
@@ -132,11 +135,12 @@ if __name__ == '__main__':
         accelerator.init_trackers(
             project_name='animate',
             config={'num_gpus': accelerator.num_processes, 'num_frames': num_frames, 'learning_rate': learning_rate,
-                        'batch_size': stage_one_batch_size, 'steps': stage_one_steps, 'mode': 'model_parallel', 'stage': 1}
+                        'batch_size': stage_one_batch_size, 'steps': stage_one_steps, 'mode': 'model_parallel', 'stage': 1,
+                        'start_ckpt': start_ckpt}
         )
 
     # get the models
-    models = get_models(num_channels_latent, num_frames, 'cpu') #, ckpt='../ckpts/ckpt_s1_t1702357167.pt')
+    models = get_models(num_channels_latent, num_frames, 'cpu', ckpt=start_ckpt)
     
     # get relevant models and settings from the models, all models on first gpu except video net
     vision_processor: CLIPImageProcessor = models['vision_processor']
@@ -154,10 +158,6 @@ if __name__ == '__main__':
 
     # define dataloader and optimizer for stage one training
     train_dataloader, val_dataloader = get_image_dataloader(stage_one_batch_size, num_frames)
-    optimizer = torch.optim.AdamW(
-        list(pose_guider_net.parameters()) + list(video_net.parameters())  + list(reference_net.parameters()),
-        lr=learning_rate,
-    )
 
     pose_guider_net, reference_net, video_net, train_dataloader = accelerator.prepare(
         pose_guider_net, reference_net, video_net, train_dataloader,
@@ -224,7 +224,7 @@ if __name__ == '__main__':
                 loss_item = loss.detach().item()
                 accelerator.log({"stage_one_train_loss": loss_item})
                 
-                if global_step % 1000 == 0:
+                if global_step % 3000 == 0:
                     out_path = join('../out/train', f'train_mp_{global_step}.png')
                     tqdm.write('generating evaluation image...')
                     initial_noise_shape = (1, num_channels_latent, latent_height, latent_width)

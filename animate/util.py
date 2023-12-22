@@ -9,6 +9,7 @@ from diffusers import StableDiffusionPipeline
 from transformers import CLIPVisionModel, CLIPImageProcessor
 from diffusers.schedulers import PNDMScheduler
 from einops import rearrange, repeat
+import numpy as np
 
 from models.poseguider import PoseGuider
 from models.referencenet import ReferenceNet
@@ -119,6 +120,9 @@ def get_models(latent_channels, num_frames, device, ckpt: str=""):
         'pose_guider_net': pose_guider_net
     }
 
+    if ckpt != "":
+        models['optimizer_state'] = ckpt_dict['optimizer']
+
     return models
 
 # infer_fixed_sample runs inference for a fixed sample
@@ -211,4 +215,21 @@ def infer_fixed_sample_mp(noise_shape, num_frames, inference_steps, scheduler, v
     images = vae.decode(1 / vae_scaling_factor * latents.to('cuda:0', dtype=dtype), return_dict=False)[0]
     images = vae_image_processor.postprocess(images, output_type="pil")
     images[0].save(out_path)
+
+# load_mm loads a motion module into video net
+def load_mm(video_net: VideoNet, mm_state_dict):
+    refactored_mm_state_dict = {}
+    for key in mm_state_dict:
+        key_split = key.split('.')
+        
+        # modify the key split to have the correct arguments (except first unet)
+        key_split[2] = 'attentions'
+        key_split.insert(4, 'tam')
+        new_key = '.'.join(key_split)
+        refactored_mm_state_dict[new_key] = mm_state_dict[key]
+
+    # load the modified weights into video_net
+    _, unexpected = video_net.unet.load_state_dict(refactored_mm_state_dict, strict=False)
+
+    return
 

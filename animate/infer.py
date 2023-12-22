@@ -8,6 +8,7 @@ from transformers import CLIPVisionModel, CLIPImageProcessor
 from diffusers.schedulers import PNDMScheduler
 from diffusers.models import AutoencoderKL
 from diffusers.image_processor import VaeImageProcessor
+from accelerate import Accelerator
 from einops import repeat
 
 from models.poseguider import PoseGuider
@@ -34,17 +35,34 @@ def infer_frames(ckpt, out_dir, pose_paths, ref_image_path):
 
     # get relevant models and settings from the models
     vision_processor: CLIPImageProcessor = models['vision_processor']
-    vision_encoder: CLIPVisionModel = models['vision_encoder']
-    vae: AutoencoderKL = models['vae']
-    pose_guider_net: PoseGuider = models['pose_guider_net']
-    reference_net: ReferenceNet = models['reference_net']
-    video_net: VideoNet = models['video_net']
+    vision_encoder: CLIPVisionModel = models['vision_encoder'].to('cuda:0', dtype=torch.bfloat16)
+    vae: AutoencoderKL = models['vae'].to('cuda:0', dtype=torch.bfloat16)
+    pose_guider_net: PoseGuider = models['pose_guider_net'].to('cuda:0')
+    reference_net: ReferenceNet = models['reference_net'].to('cuda:0')
+    video_net: VideoNet = models['video_net'].to('cuda:0')
     scheduler: PNDMScheduler = models['scheduler']
     vae_scaling_factor = vae.config.scaling_factor
     vae_image_processor = VaeImageProcessor(vae_scale_factor=vae_scaling_factor)
 
     scheduler.set_timesteps(inference_steps, device=device)
     video_net.batch_size = 1
+
+    # configuration_values
+    config = {
+        "gradient_accumulation_steps": 2,
+        "mixed_precision": 'bf16'
+    }
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=config['gradient_accumulation_steps'],
+        mixed_precision=config['mixed_precision'],
+        log_with="wandb",
+    )
+
+    pose_guider_net, reference_net, video_net = accelerator.prepare(
+        pose_guider_net, reference_net, video_net,
+        device_placement=[False, False, False]
+    )    
 
     # set all models to eval mode
     pose_guider_net.eval()
@@ -77,16 +95,18 @@ def infer_frames(ckpt, out_dir, pose_paths, ref_image_path):
         
         # create noise and timestep
         initial_noise_shape = (num_frames, num_channels_latent, latent_height, latent_width)
-        latents = get_initial_noise_latents(initial_noise_shape, scheduler, device) * 1 / scheduler.init_noise_sigma + pose_embeddings
+        latents = get_initial_noise_latents(initial_noise_shape, scheduler, device)
         timesteps = retrieve_inference_timesteps(scheduler, inference_steps, device)
 
         # complete denoising through all timesteps
         for i, t in enumerate(timesteps):
             print(f'[*] denoising step {i}/{inference_steps}')
-            noise_pred = video_net(latents, t, reference_frame_embeddings, clip_raw_frame_embeddings, skip_temporal_attn=False)
-            latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            input_latents = latents + pose_embeddings
+            noise_pred = video_net(input_latents, t, reference_frame_embeddings, clip_raw_frame_embeddings, skip_temporal_attn=True)
+            latents = scheduler.step(noise_pred, t, input_latents, return_dict=False)[0]
 
         # decode image latents and write to out
+        latents = latents.to(dtype=torch.bfloat16)
         images = vae.decode(1 / vae_scaling_factor * latents, return_dict=False)[0]
         images = vae_image_processor.postprocess(images, output_type="pil")
         for i in range(len(images)):
@@ -107,5 +127,5 @@ if __name__ == '__main__':
     for pose_frame_num in pose_frames:
         pose_paths.append(join(root_data_folder, '00001/densepose', f'{pose_frame_num:04d}.png'))
 
-    infer_frames('../ckpts/ckpt_s1_t1702453779.pt', join(root_out_folder, 'infer'), pose_paths, ref_img_path)
+    infer_frames('../ckpts/ckpt_s1_t1703121393_v2.pt', join(root_out_folder, 'infer'), pose_paths, ref_img_path)
 
