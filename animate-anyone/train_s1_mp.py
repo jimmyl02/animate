@@ -136,7 +136,7 @@ if __name__ == '__main__':
             project_name='animate',
             config={'num_gpus': accelerator.num_processes, 'num_frames': num_frames, 'learning_rate': learning_rate,
                         'batch_size': stage_one_batch_size, 'steps': stage_one_steps, 'mode': 'model_parallel', 'stage': 1,
-                        'start_ckpt': start_ckpt}
+                        'start_ckpt': start_ckpt, 'vnet_version': 4}
         )
 
     # get the models

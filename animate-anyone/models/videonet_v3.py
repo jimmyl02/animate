@@ -48,30 +48,32 @@ class SpatialAttentionModule(nn.Module):
 
         # re-arrange data from (b*t,c,h,w) to correct groupings to [b*t,w*h,c]
         grouped_x = rearrange(proj_x, 'bt c h w -> bt (h w) c')
-        reshaped_x = rearrange(x, 'bt c h w -> bt (h w) c')
 
         # compute self-attention on the concatenated data along w dimension
-        q, k, v = self.to_q(reshaped_x), self.to_k(grouped_x), self.to_v(grouped_x)
+        q, k, v = self.to_q(grouped_x), self.to_k(grouped_x), self.to_v(grouped_x)
 
         # split embeddings for multi-headed attention
-        q = rearrange(q, 'bt (h w) (n d) -> bt (h w) n d', h=x.shape[2], w=x.shape[3], n=self.num_heads)
+        q = rearrange(q, 'bt (h w) (n d) -> bt (h w) n d', h=h, w=w, n=self.num_heads)
         k = rearrange(k, 'bt (h w) (n d) -> bt (h w) n d', h=h, w=w, n=self.num_heads)
         v = rearrange(v, 'bt (h w) (n d) -> bt (h w) n d', h=h, w=w, n=self.num_heads)
 
         # run attention calculation
         attn_out = memory_efficient_attention(q, k, v)
         # reshape from multihead
-        attn_out = rearrange(attn_out, 'bt (h w) n d -> bt (h w) (n d)', h=x.shape[2], w=x.shape[3], n=self.num_heads)
+        attn_out = rearrange(attn_out, 'bt (h w) n d -> bt (h w) (n d)', h=h, w=w, n=self.num_heads)
         
-        norm1_out = self.norm1(attn_out + reshaped_x)
+        norm1_out = self.norm1(attn_out + grouped_x)
         ffn_out = self.ffn(norm1_out)
         attn_out = self.norm2(norm1_out + ffn_out)
 
         # re-arrange data from (b*t,w*h,c) to (b*t,c,h,w)
-        attn_out = rearrange(attn_out, 'bt (h w) c -> bt c h w', h=x.shape[2], w=x.shape[3])
+        attn_out = rearrange(attn_out, 'bt (h w) c -> bt c h w', h=h, w=w)
+
+        # take only the first half of the output concat tensor (b,c,h,w)
+        out = attn_out[:, :, :, :orig_w]
 
         # pass output through out projection
-        out = self.proj_out(attn_out)
+        out = self.proj_out(out)
 
         # return sliced out with x as adding residual before reshape would be the same as adding x
         return out + x
@@ -265,4 +267,3 @@ class VideoNet(nn.Module):
             timesteps,
             encoder_hidden_states=clip_condition_embeddings,
         )[0]
-
