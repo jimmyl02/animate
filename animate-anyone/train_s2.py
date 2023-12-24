@@ -105,7 +105,7 @@ if __name__ == '__main__':
     stage_two_steps = 40000 # TODO: adjust step count
     latent_width, latent_height = 48, 72
     num_channels_latent = 4
-    num_frames = 10
+    num_frames = 8
     inference_steps = 50
     learning_rate = 1e-5
 
@@ -128,13 +128,13 @@ if __name__ == '__main__':
     # init wandb tracking
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name='animate',
+            project_name='animate_s2',
             config={'num_gpus': accelerator.num_processes, 'num_frames': num_frames, 'learning_rate': learning_rate,
                         'batch_size': stage_two_batch_size, 'steps': stage_two_steps, 'mode': 'dataparallel_gpu', 'stage': 2}
         )
 
     # get the models
-    models = get_models(num_channels_latent, num_frames, device) #, ckpt='../ckpts/ckpt_s1_t1702357167.pt')
+    models = get_models(num_channels_latent, num_frames, device, ckpt='../ckpts/ckpt_s1_t1703297604_v3.pt')
     
     # get relevant models and settings from the models
     vision_processor: CLIPImageProcessor = models['vision_processor']
@@ -161,7 +161,17 @@ if __name__ == '__main__':
     - stage one training objective is generating good images from poses (no temporal consistency)
     '''
 
-    # define dataloader and optimizer for stage one training
+    # disable gradients for reference net, pose guider, and video net
+    reference_net.requires_grad_(False)
+    pose_guider_net.requires_grad_(False)
+    video_net.requires_grad_(False)
+
+    # re-enable weights only for temporal attention modules
+    for i in range(len(video_net.ref_cond_attn_blocks)):
+        # update the number of frames
+        video_net.ref_cond_attn_blocks[i].tam.requires_grad_(True)
+
+    # prepare models, dataloader, and optimizer for training
     train_dataloader, val_dataloader = get_image_dataloader(stage_two_batch_size, num_frames)
     pose_guider_net, reference_net, video_net, train_dataloader = accelerator.prepare(
         pose_guider_net, reference_net, video_net, train_dataloader
@@ -175,16 +185,6 @@ if __name__ == '__main__':
     # move vae and text encoder to correct device and dtype
     vision_encoder.to(device, dtype=torch.bfloat16)
     vae.to(device, dtype=torch.bfloat16)
-
-    # disable gradients for reference net, pose guider, and video net
-    reference_net.requires_grad_(False)
-    pose_guider_net.requires_grad_(False)
-    video_net.requires_grad_(False)
-
-    # re-enable weights only for temporal attention modules
-    for i in range(len(video_net.ref_cond_attn_blocks)):
-        # update the number of frames
-        video_net.ref_cond_attn_blocks[i].tam.requires_grad_(True)
 
     if accelerator.is_main_process:
         pbar = tqdm(total=stage_two_steps)
@@ -226,7 +226,7 @@ if __name__ == '__main__':
             with accelerator.accumulate(video_net):
                 # 6) predict noise for video frames
                 conditioned_noise_latents = img_noise_latents + pose_embeddings
-                noise_pred = video_net(conditioned_noise_latents, train_timesteps, reference_frame_embeddings, clip_raw_frame_embeddings, skip_temporal_attn=True)
+                noise_pred = video_net(conditioned_noise_latents, train_timesteps, reference_frame_embeddings, clip_raw_frame_embeddings, skip_temporal_attn=False)
                 loss = F.mse_loss(noise_pred, initial_noise_latents)
                 avg_loss = accelerator.gather_for_metrics(loss.detach()).mean().item()
                 accelerator.backward(loss)

@@ -27,7 +27,7 @@ def infer_frames(ckpt, out_dir, pose_paths, ref_image_path):
     # configuration settings
     latent_width, latent_height = 48, 72
     num_channels_latent = 4
-    num_frames = 10
+    num_frames = 8
     inference_steps = 50
 
     models = get_models(num_channels_latent, num_frames, device, ckpt=ckpt)
@@ -121,11 +121,11 @@ def infer_frames(ckpt, out_dir, pose_paths, ref_image_path):
 
 if __name__ == '__main__':
     # infer frames
-    ref_img_path = join(root_data_folder, '00001/images/0001.png')
+    ref_img_path = join(root_data_folder, '00052/images/0001.png')
     pose_paths = []
-    pose_frames = [1,2,3,4,5,6,7,8,9,10]
+    pose_frames = [1,2,3,4,5,6,7,8]
     for pose_frame_num in pose_frames:
-        pose_paths.append(join(root_data_folder, '00001/densepose', f'{pose_frame_num:04d}.png'))
+        pose_paths.append(join(root_data_folder, '00005/densepose', f'{pose_frame_num:04d}.png'))
 
-    infer_frames('../ckpts/ckpt_s1_t1703121393_v2.pt', join(root_out_folder, 'infer'), pose_paths, ref_img_path)
+    infer_frames('../ckpts/ckpt_s2_t1703365338.pt', join(root_out_folder, 'infer'), pose_paths, ref_img_path)
 
