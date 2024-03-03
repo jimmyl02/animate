@@ -1,7 +1,8 @@
 venv
 datasets
 wandb
-!animate/datasets
+!animate-anyone/datasets
+!moore-animate-anyone/datasets
 ckpts
 out
 

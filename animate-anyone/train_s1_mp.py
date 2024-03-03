@@ -244,6 +244,5 @@ if __name__ == '__main__':
             # evaluate loss on the validation set
             get_validation_loss(val_dataloader, num_frames, pose_guider_net, reference_net, video_net, vision_encoder, vae, vae_scaling_factor)
 
-
     # checkpoint models after stage one
     save_model_checkpoint(ckpt_dir, 1, pose_guider_net, reference_net, video_net, optimizer)

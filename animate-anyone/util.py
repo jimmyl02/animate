@@ -5,9 +5,11 @@ from os.path import join
 import torch
 from torchvision import io
 from torchvision.transforms import v2
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionImageVariationPipeline, StableDiffusionPipeline
+from diffusers.models import AutoencoderKL
 from transformers import CLIPVisionModel, CLIPImageProcessor
 from diffusers.schedulers import PNDMScheduler
+from diffusers.image_processor import VaeImageProcessor
 from einops import rearrange, repeat
 import numpy as np
 
@@ -54,9 +56,8 @@ def get_initial_noise_latents(shape, scheduler, device):
 def get_conditioning_embeddings(vision_processor, vision_encoder, vae, ref_img_data, num_frames, vae_scaling_factor, device):
     with torch.no_grad():
         # 1) generate embeddings from CLIP vision encoder
-        processed_ref_img_embeddings = vision_processor(images=ref_img_data, return_tensors="pt").to(device)
-        clip_raw_img_embeddings = vision_encoder(**processed_ref_img_embeddings).last_hidden_state
-        clip_raw_img_embeddings = clip_raw_img_embeddings / clip_raw_img_embeddings.norm(p=2, dim=-1, keepdim=True) # we need to normalize the CLIP embedding
+        processed_ref_img_embeddings = vision_processor(images=ref_img_data, return_tensors="pt").pixel_values.to(device)
+        clip_raw_img_embeddings = vision_encoder(processed_ref_img_embeddings).image_embeds.unsqueeze(1)
     
         # clip_raw_frame_embeddings is the raw clip embeddings repeated for each frame
         clip_raw_frame_embeddings = repeat(clip_raw_img_embeddings, 'b l d -> (b repeat) l d', repeat=num_frames)
@@ -67,25 +68,31 @@ def get_conditioning_embeddings(vision_processor, vision_encoder, vae, ref_img_d
     return clip_raw_img_embeddings, clip_raw_frame_embeddings, encoded_ref_img_embeddings
 
 # encode_images encodes images with the vae
-def encode_images(vae, image_data, vae_scaling_factor, dtype=torch.bfloat16):
+def encode_images(vae: AutoencoderKL, image_data, vae_scaling_factor, dtype=torch.bfloat16):
     with torch.no_grad():
-        encoded_img_embeddings = vae.encode(image_data.to(dtype=dtype))['latent_dist'].mean * vae_scaling_factor
+        normalized_img = v2.Normalize([0.5], [0.5])(image_data.to(dtype=dtype))
+        encoded_img_embeddings = vae.encode(normalized_img)['latent_dist'].mean * vae_scaling_factor
         return encoded_img_embeddings
-
-# decode_images decodes images with the vae
-def decode_images(vae, encoded_img_data, vae_scaling_factor):
-    with torch.no_grad():
-        return vae.decode(1 / vae_scaling_factor * encoded_img_data)[0]
 
 # get_models gets the default models
 def get_models(latent_channels, num_frames, device, ckpt: str=""):
-    pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5").to(device)
+    # define vae
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
+
+    # construct pipe from imag evariation diffuser
+    pipe = StableDiffusionImageVariationPipeline.from_pretrained("lambdalabs/sd-image-variations-diffusers", revision="v2.0", vae=vae).to(device)
     
     # define and freeze vision encoder weights
-    vision_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    vision_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-    vision_encoder.requires_grad_(False)
-    vision_encoder.eval()
+    vision_processor =  pipe.feature_extractor
+    vision_encoder = pipe.image_encoder
+
+    # pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5").to(device)
+    
+    # # define and freeze vision encoder weights
+    # vision_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    # vision_encoder = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+    # vision_encoder.requires_grad_(False)
+    # vision_encoder.eval()
 
     scheduler = copy.deepcopy(pipe.scheduler)
     reference_net = ReferenceNet(pipe.unet).to(device)
@@ -127,7 +134,7 @@ def get_models(latent_channels, num_frames, device, ckpt: str=""):
 
 # infer_fixed_sample runs inference for a fixed sample
 def infer_fixed_sample(noise_shape, num_frames, inference_steps, scheduler, vision_processor,
-                        vision_encoder, vae, vae_scaling_factor, pose_guider_net, reference_net,
+                        vision_encoder, vae: AutoencoderKL, vae_scaling_factor, pose_guider_net, reference_net,
                         video_net, vae_image_processor, out_path, device, dtype=torch.bfloat16):
     # statically set input and outputs for training image generation
     root_data_folder = '../datasets/TikTok_dataset/TikTok_dataset'
@@ -172,8 +179,8 @@ def infer_fixed_sample(noise_shape, num_frames, inference_steps, scheduler, visi
 
 # infer_fixed_sample runs inference for a fixed sample
 def infer_fixed_sample_mp(noise_shape, num_frames, inference_steps, scheduler, vision_processor,
-                        vision_encoder, vae, vae_scaling_factor, pose_guider_net, reference_net,
-                        video_net, vae_image_processor, out_path, dtype=torch.bfloat16):
+                        vision_encoder, vae: AutoencoderKL, vae_scaling_factor, pose_guider_net, reference_net,
+                        video_net, vae_image_processor: VaeImageProcessor, out_path, dtype=torch.bfloat16):
     # statically set input and outputs for training image generation
     root_data_folder = '../datasets/TikTok_dataset/TikTok_dataset'
     ref_img_path = join(root_data_folder, '00001/images/0001.png')

@@ -1,0 +1,14 @@
+pretrained_base_model_path: "../ckpts/stable-diffusion-v1-5/"
+pretrained_vae_path: "../ckpts/sd-vae-ft-mse"
+image_encoder_path: "../ckpts/image_encoder"
+denoising_unet_path: "../ckpts/denoising_unet.pth"
+reference_unet_path: "../ckpts/reference_unet.pth"
+pose_guider_path: "../ckpts/pose_guider.pth"
+motion_module_path: "../ckpts/motion_module.pth"
+
+inference_config: "./configs/inference_v2.yaml"
+weight_dtype: 'fp16'
+
+test_cases:
+  "../datasets/movie/1/image.png":
+    - "../datasets/movie/1/opose.mp4" 

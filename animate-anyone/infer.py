@@ -15,7 +15,7 @@ from models.poseguider import PoseGuider
 from models.referencenet import ReferenceNet
 from models.videonet import VideoNet
 
-from util import get_models, get_conditioning_embeddings, decode_images, get_initial_noise_latents, retrieve_inference_timesteps
+from util import get_models, get_conditioning_embeddings, get_initial_noise_latents, retrieve_inference_timesteps
 
 device = 'cuda'
 root_data_folder = '../datasets/TikTok_dataset/TikTok_dataset'
